@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PixelWars — Real-time collaborative canvas at internet scale.
+  DynamoDB (single-table, Global Tables, Streams, TTL) + Lambda + WebSocket API Gateway.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  SecondaryRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Second region for DynamoDB Global Tables
+
+Mappings:
+  TableConfig:
+    dev:
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecovery: false
+    prod:
+      BillingMode: PAY_PER_REQUEST  # On-demand — scales to 100K+ writes/sec
+      PointInTimeRecovery: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB Single-Table ────────────────────────────────────────────────────
+  # All entities: pixels, users, cooldowns, leaderboard, faction stats, WS connections
+  PixelWarsTable:
+    Type: AWS::DynamoDB::GlobalTable
+    Properties:
+      TableName: !Sub pixelwars-${Environment}
+      BillingMode: !FindInMap [TableConfig, !Ref Environment, BillingMode]
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES   # Stream all pixel changes for real-time propagation
+      # TTL attribute — DynamoDB auto-expires cooldowns and stale WS connections
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: N   # Numeric for sort by pixel count (leaderboard)
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        # GSI1: Faction-based pixel queries (which pixels does faction 'red' own?)
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [x, y, color, faction, placedBy, placedAt]
+        # GSI2: Global leaderboard — sorted by pixels placed (descending)
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [userId, username, faction, pixelsPlaced]
+      # Multi-region replicas for DynamoDB Global Tables
+      Replicas:
+        - Region: !Ref AWS::Region
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: !FindInMap [TableConfig, !Ref Environment, PointInTimeRecovery]
+          Tags:
+            - Key: Project
+              Value: PixelWars
+            - Key: Environment
+              Value: !Ref Environment
+        - Region: !Ref SecondaryRegion
+          PointInTimeRecoverySpecification:
+            PointInTimeRecoveryEnabled: !FindInMap [TableConfig, !Ref Environment, PointInTimeRecovery]
+
+  # ── WebSocket API Gateway ────────────────────────────────────────────────────
+  PixelWarsWebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub pixelwars-${Environment}-ws
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      Tags:
+        Project: PixelWars
+
+  WebSocketConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${WebSocketConnectIntegration}
+
+  WebSocketDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${WebSocketDisconnectIntegration}
+
+  WebSocketDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub integrations/${WebSocketDefaultIntegration}
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      StageName: !Ref Environment
+      AutoDeploy: true
+
+  # ── Lambda Role ──────────────────────────────────────────────────────────────
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pixelwars-${Environment}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt PixelWarsTable.Arn
+                  - !Sub ${PixelWarsTable.Arn}/index/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !Sub ${PixelWarsTable.Arn}/stream/*
+        - PolicyName: WebSocketManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: execute-api:ManageConnections
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixelWarsWebSocketAPI}/${Environment}/POST/@connections/*
+
+  # ── Lambda: WebSocket Connection Manager ─────────────────────────────────────
+  WsConnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pixelwars-${Environment}-ws-connect
+      Description: Handles WebSocket $connect — stores connection ID in DynamoDB
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PixelWarsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          exports.handler = async (event) => {
+            const connId = event.requestContext.connectionId;
+            const ttl = Math.floor(Date.now() / 1000) + 3600; // 1 hour TTL
+            await ddb.send(new PutCommand({
+              TableName: process.env.TABLE_NAME,
+              Item: { PK: `CONN#${connId}`, SK: 'METADATA', connId, connectedAt: new Date().toISOString(), expiresAt: ttl }
+            }));
+            return { statusCode: 200 };
+          };
+
+  WsDisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pixelwars-${Environment}-ws-disconnect
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PixelWarsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+          const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          exports.handler = async (event) => {
+            const connId = event.requestContext.connectionId;
+            await ddb.send(new DeleteCommand({ TableName: process.env.TABLE_NAME, Key: { PK: `CONN#${connId}`, SK: 'METADATA' }}));
+            return { statusCode: 200 };
+          };
+
+  # ── Lambda: DynamoDB Stream Processor (THE CORE!) ────────────────────────────
+  # This Lambda reads DynamoDB Streams and broadcasts pixel changes to all connected WS clients
+  StreamProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub pixelwars-${Environment}-stream-processor
+      Description: >
+        Processes DynamoDB Streams — when a pixel is placed, broadcasts the update
+        to all connected WebSocket clients. This is the real-time engine of PixelWars.
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref PixelWarsTable
+          WS_ENDPOINT: !Sub https://${PixelWarsWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+          const { ApiGatewayManagementApiClient, PostToConnectionCommand } = require('@aws-sdk/client-apigatewaymanagementapi');
+          const { unmarshall } = require('@aws-sdk/util-dynamodb');
+
+          const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const wsClient = new ApiGatewayManagementApiClient({ endpoint: process.env.WS_ENDPOINT });
+
+          exports.handler = async (event) => {
+            // Extract pixel events from DynamoDB Streams records
+            const pixelEvents = event.Records
+              .filter(r => r.eventName === 'INSERT' || r.eventName === 'MODIFY')
+              .filter(r => r.dynamodb.NewImage?.SK?.S?.startsWith('PIXEL#'))
+              .map(r => {
+                const item = unmarshall(r.dynamodb.NewImage);
+                return { type: 'PIXEL_PLACED', x: item.x, y: item.y, color: item.color, faction: item.faction, placedBy: item.placedBy };
+              });
+
+            if (pixelEvents.length === 0) return;
+
+            // Get all active WebSocket connections
+            const connsResult = await ddb.send(new QueryCommand({
+              TableName: process.env.TABLE_NAME,
+              KeyConditionExpression: 'begins_with(PK, :prefix)',
+              ExpressionAttributeValues: { ':prefix': 'CONN#' },
+              IndexName: 'ConnByTime', // GSI on connections
+            }));
+
+            const connections = connsResult.Items || [];
+            const message = JSON.stringify({ events: pixelEvents });
+
+            // Broadcast to all connections in parallel
+            await Promise.allSettled(
+              connections.map(conn =>
+                wsClient.send(new PostToConnectionCommand({
+                  ConnectionId: conn.connId,
+                  Data: Buffer.from(message)
+                })).catch(() => {}) // stale connections will fail silently
+              )
+            );
+          };
+
+  # DynamoDB Streams → Lambda event source mapping
+  StreamEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PixelWarsTable.StreamArn
+      FunctionName: !GetAtt StreamProcessorFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 1   # Process every 1 second for near-real-time
+      FilterCriteria:
+        Filters:
+          # Only process PIXEL entity changes (filter out cooldowns, connections)
+          - Pattern: '{"dynamodb": {"NewImage": {"entityType": {"S": ["PIXEL"]}}}}'
+
+  # ── Lambda integrations for API Gateway WebSocket ────────────────────────────
+  WebSocketConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations
+
+  WebSocketDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations
+
+  WebSocketDefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PixelWarsWebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations
+
+  # Lambda permissions for API Gateway
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsDisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  # ── CloudWatch Alarms ────────────────────────────────────────────────────────
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub pixelwars-${Environment}-dynamodb-throttle
+      MetricName: WriteThrottleEvents
+      Namespace: AWS/DynamoDB
+      Dimensions:
+        - Name: TableName
+          Value: !Ref PixelWarsTable
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref PixelWarsTable
+    Export:
+      Name: !Sub pixelwars-${Environment}-table-name
+
+  DynamoDBTableArn:
+    Description: DynamoDB table ARN
+    Value: !GetAtt PixelWarsTable.Arn
+
+  WebSocketEndpoint:
+    Description: WebSocket API endpoint (use as NEXT_PUBLIC_WEBSOCKET_URL)
+    Value: !Sub wss://${PixelWarsWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub pixelwars-${Environment}-ws-endpoint
+
+  WebSocketManagementEndpoint:
+    Description: WebSocket management API endpoint (for Lambda to push messages)
+    Value: !Sub https://${PixelWarsWebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}

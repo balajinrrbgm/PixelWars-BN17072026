@@ -1,0 +1,84 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0a0a0a;
+  --foreground: #f8fafc;
+  --canvas-bg: #111111;
+  --canvas-grid: #1a1a1a;
+
+  /* Faction colors */
+  --faction-red:    #ef4444;
+  --faction-blue:   #3b82f6;
+  --faction-green:  #22c55e;
+  --faction-yellow: #eab308;
+  --faction-purple: #a855f7;
+  --faction-orange: #f97316;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, sans-serif;
+  overscroll-behavior: none;
+}
+
+/* Pixel canvas rendering — crisp pixels, no antialiasing */
+.pixel-canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* Pixel grid cell — 1px black border for grid effect */
+.pixel-cell {
+  border: 0.5px solid rgba(0, 0, 0, 0.3);
+  transition: transform 0.1s ease-out;
+}
+
+.pixel-cell:hover {
+  transform: scale(1.2);
+  z-index: 10;
+  position: relative;
+}
+
+/* Faction territory bars */
+.faction-bar {
+  height: 8px;
+  border-radius: 4px;
+  transition: width 0.5s ease-out;
+}
+
+/* Leaderboard rank colors */
+.rank-1 { color: #ffd700; }
+.rank-2 { color: #c0c0c0; }
+.rank-3 { color: #cd7f32; }
+
+/* Cooldown timer */
+.cooldown-overlay {
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+}
+
+/* Scale badge */
+.scale-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+}
